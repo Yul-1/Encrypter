@@ -4,4 +4,4 @@ target/
 *.log
 Test/
 *.old
-src/*.old
+*.txt
