@@ -8,13 +8,16 @@ use argon2::{
 };
 use rand::{Rng, RngCore};
 use rand::distributions::Alphanumeric;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
 use sha2::{Sha256, Digest};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 const CHUNK_SIZE: usize = 4096 * 1024;
 const PROGRESS_THRESHOLD: u64 = 1024 * 1024;
@@ -103,7 +106,13 @@ fn encrypt_entry_point(path_str: &str) -> Result<(), Box<dyn std::error::Error>>
     let final_key_path = get_unique_path(key_path)?;
 
     {
-        let mut key_file = File::create(&final_key_path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut key_file = options.open(&final_key_path)?;
         key_file.write_all(&protected_key)?;
         key_file.sync_all()?;
     }
@@ -161,7 +170,7 @@ fn decrypt_entry_point(path_str: &str, keyfile_str: &str) -> Result<(), Box<dyn 
         println!("\nWARNING: Key file was NOT deleted because errors occurred.");
     } else {
         println!("\nVerification: All operations successful.");
-        fs::remove_file(key_path)?;
+        secure_delete(key_path)?;
         println!("SUCCESS: Key file deleted securely.");
     }
 
@@ -207,7 +216,7 @@ fn encrypt_directory_recursive(path: &Path, key: &SecureKey) -> Result<(), Box<d
     let new_path = parent.join(random_name);
 
     fs::rename(path, &new_path)?;
-    println!("Encrypted Dir: {} -> {}", original_name, new_path.file_name().unwrap().to_string_lossy());
+    println!("Encrypted Dir: {} -> {}", original_name, new_path.file_name().unwrap_or_default().to_string_lossy());
 
     Ok(())
 }
@@ -227,7 +236,13 @@ fn decrypt_directory_recursive(path: &Path, key: &SecureKey, stats: &mut Encrypt
                 let new_path = get_unique_path(parent.join(&original_name))?;
 
                 fs::rename(path, &new_path)?;
-                fs::remove_file(new_path.join(".dirname.enc"))?;
+                
+                let marker_in_new_path = new_path.join(".dirname.enc");
+                if marker_in_new_path.exists() {
+                    if let Err(e) = secure_delete(&marker_in_new_path) {
+                        eprintln!("Warning: Failed to securely delete marker {}: {}", marker_in_new_path.display(), e);
+                    }
+                }
                 
                 println!("Restored Dir: {}", new_path.display());
                 new_path
@@ -357,7 +372,9 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     dest_file.write_all(&encrypted_hash)?;
 
     dest_file.sync_all()?;
-    fs::remove_file(filepath)?;
+    
+    drop(source_file);
+    secure_delete(filepath)?;
     
     println!("Done: File encrypted and integrity secured.");
     Ok(())
@@ -427,7 +444,7 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
 
             if stored_hash.as_slice() != calculated_hash.as_slice() {
                 drop(dest_file);
-                fs::remove_file(&original_path)?;
+                secure_delete(&original_path)?;
                 return Err("CRITICAL: Integrity Mismatch. File content has been modified or truncated.".into());
             }
             
@@ -458,12 +475,15 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
 
     if !integrity_verified {
         drop(dest_file);
-        fs::remove_file(&original_path)?;
+        secure_delete(&original_path)?;
         return Err("CRITICAL: Truncated file. Integrity footer missing.".into());
     }
 
     dest_file.sync_all()?;
-    fs::remove_file(filepath)?;
+    
+    drop(source_file);
+    secure_delete(filepath)?;
+    
     println!("Restored and Verified: {}", original_path.file_name().unwrap_or_default().to_string_lossy());
 
     Ok(())
@@ -590,4 +610,33 @@ fn get_unique_path(path: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>>
         if !new_path.exists() { return Ok(new_path); }
     }
     Err("Too many duplicates".into())
+}
+
+fn secure_delete(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let metadata = fs::metadata(path)?;
+    let len = metadata.len();
+    
+    {
+        let mut file = OpenOptions::new().write(true).open(path)?;
+        let mut rng = OsRng;
+        let buffer_size = 4096 * 1024; // 4MB chunks
+        let mut buffer = vec![0u8; buffer_size];
+        let mut written_bytes = 0;
+
+        file.seek(SeekFrom::Start(0))?;
+
+        while written_bytes < len {
+            let remaining = len - written_bytes;
+            let to_write = std::cmp::min(remaining, buffer_size as u64) as usize;
+            
+            rng.fill_bytes(&mut buffer[0..to_write]);
+            file.write_all(&buffer[0..to_write])?;
+            
+            written_bytes += to_write as u64;
+        }
+        file.sync_all()?;
+    }
+
+    fs::remove_file(path)?;
+    Ok(())
 }

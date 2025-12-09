@@ -5,3 +5,4 @@ target/
 Test/
 *.old
 *.txt
+*.7z
