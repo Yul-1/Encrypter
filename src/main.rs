@@ -3,7 +3,8 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-use rand::RngCore;
+use rand::{Rng, RngCore};
+use rand::distributions::Alphanumeric;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
 
 const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
-const PROGRESS_THRESHOLD: u64 = 1024 * 1024; // 1MB - mostra progress per file > 1MB
+const PROGRESS_THRESHOLD: u64 = 1024 * 1024; // 1MB
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -47,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn encrypt_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(path);
     
-    // Chiedi password
+    // Ask for password
     let password = read_password("Inserisci password per proteggere la chiave: ")?;
     let password_confirm = read_password("Conferma password: ")?;
     
@@ -55,45 +56,47 @@ fn encrypt_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err("Le password non corrispondono".into());
     }
 
-    // Genera chiave master
+    // Generate random master key
     let mut master_key = [0u8; 32];
     OsRng.fill_bytes(&mut master_key);
 
-    // Cripta la chiave master con la password
+    // Encrypt master key with user password
     let protected_key = protect_key_with_password(&master_key, &password)?;
     
     if path.is_file() {
-        // Trova suffisso libero per entrambi i file
-        let base_encrypted = path.with_extension(
-            format!("{}.encrypted", 
-                    path.extension().and_then(|s| s.to_str()).unwrap_or("")
-            )
-        );
-        let base_key = path.with_extension("key");
+        // Encrypt single file
+        encrypt_file(path, &master_key)?;
         
-        let (encrypted_path, key_path) = find_paired_unique_paths(base_encrypted, base_key)?;
+        // Save .key file next to the encrypted file (using original name + .key for identification)
+        // Note: The encrypted file itself will have a random name.
+        let key_path = path.with_extension("key");
         
-        // Cripta file
-        encrypt_file_to_path(path, &master_key, &encrypted_path)?;
+        // Handle collision for key file if exists
+        let key_path = get_unique_path(key_path)?;
         
-        // Salva chiave protetta
         fs::write(&key_path, &protected_key)?;
         println!("✓ Chiave salvata: {}", key_path.display());
+        
     } else if path.is_dir() {
         let files: Vec<PathBuf> = WalkDir::new(path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
             .map(|e| e.path().to_path_buf())
+            // Skip existing key files or unrelated files if necessary
             .collect();
 
         println!("Trovati {} file da criptare", files.len());
         
         for file in &files {
+            // Check if file is likely a key or already encrypted (optional safety)
+             if file.extension().and_then(|s| s.to_str()) == Some("key") {
+                 continue;
+             }
             encrypt_file(file, &master_key)?;
         }
 
-        // Salva chiave protetta nella cartella con path unico
+        // Save master key in the root folder
         let key_path = get_unique_path(path.join("master.key"))?;
         fs::write(&key_path, &protected_key)?;
         println!("✓ Chiave master salvata: {}", key_path.display());
@@ -109,36 +112,38 @@ fn decrypt_path(path: &str, keyfile: &str) -> Result<(), Box<dyn std::error::Err
     let path_obj = Path::new(path);
     let key_path = Path::new(keyfile);
     
-    // Leggi chiave protetta
+    // Read protected key
     let protected_key = fs::read(key_path)?;
     
-    // Chiedi password
+    // Ask password
     let password = read_password("Inserisci password: ")?;
     
-    // Recupera chiave master
+    // Recover master key
     let master_key = recover_key_from_password(&protected_key, &password)?;
 
     let mut success_count = 0;
-    let mut total_files = 0;
+    let total_files; // FIX: Removed "= 0" to avoid unused assignment warning
     let mut errors = Vec::new();
 
     if path_obj.is_file() {
+        // Single file decryption
         total_files = 1;
         match decrypt_file(path_obj, &master_key) {
             Ok(_) => success_count += 1,
             Err(e) => errors.push(format!("{}: {}", path_obj.display(), e)),
         }
     } else if path_obj.is_dir() {
+        // Batch decryption
         let files: Vec<PathBuf> = WalkDir::new(path_obj)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && 
-                       e.path().extension().and_then(|s| s.to_str()) == Some("encrypted"))
+                       e.path().extension().and_then(|s| s.to_str()) == Some("enc"))
             .map(|e| e.path().to_path_buf())
             .collect();
 
         total_files = files.len();
-        println!("Trovati {} file da decriptare", total_files);
+        println!("Trovati {} file candidati (.enc)", total_files);
         
         for file in &files {
             match decrypt_file(file, &master_key) {
@@ -150,7 +155,7 @@ fn decrypt_path(path: &str, keyfile: &str) -> Result<(), Box<dyn std::error::Err
         return Err("Percorso non valido".into());
     }
 
-    // Report finale
+    // Reporting
     if !errors.is_empty() {
         println!("\n  Errori riscontrati durante la decrittazione:");
         for err in &errors {
@@ -163,35 +168,49 @@ fn decrypt_path(path: &str, keyfile: &str) -> Result<(), Box<dyn std::error::Err
     if total_files > 0 && success_count == total_files {
         println!("\nVerifica completata: {}/{} file decriptati correttamente.", success_count, total_files);
         
-        // Rimozione sicura della chiave
+        // Securely remove the key file
         fs::remove_file(key_path)?;
         println!("✓ Chiave eliminata definitivamente: {}", key_path.display());
     } else if total_files == 0 {
-        println!("Nessun file criptato trovato in questo percorso.");
+        println!("Nessun file criptato (.enc) trovato in questo percorso.");
     }
 
     Ok(())
 }
 
 fn encrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
-    // Trova path unico per il file criptato
-    let encrypted_path = get_unique_path(
-        filepath.with_extension(
-            format!("{}.encrypted", 
-                    filepath.extension().and_then(|s| s.to_str()).unwrap_or("")
-            )
-        )
-    )?;
-    
-    encrypt_file_to_path(filepath, key, &encrypted_path)
-}
-
-fn encrypt_file_to_path(filepath: &Path, key: &[u8; 32], encrypted_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let metadata = fs::metadata(filepath)?;
     let file_size = metadata.len();
     
-    println!("Criptando: {}", filepath.display());
+    // Generate a random filename to hide the original name
+    // Format: [16 random chars].enc
+    let random_name: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let encrypted_filename = format!("{}.enc", random_name);
     
+    // Determine output path in the same directory
+    let parent_dir = filepath.parent().unwrap_or_else(|| Path::new("."));
+    let encrypted_path = parent_dir.join(encrypted_filename);
+
+    // Ensure we don't overwrite an existing file (highly unlikely with 16 chars, but safe)
+    if encrypted_path.exists() {
+        return encrypt_file(filepath, key); // Retry recursion if collision
+    }
+
+    println!("Criptando: {}", filepath.display());
+
+    // 1. Prepare Metadata (Original Filename)
+    let original_filename = filepath.file_name()
+        .ok_or("Invalid filename")?
+        .to_string_lossy()
+        .to_string();
+    let filename_bytes = original_filename.as_bytes();
+    let filename_len = filename_bytes.len() as u32;
+
+    // 2. Read content
     let progress = if file_size > PROGRESS_THRESHOLD {
         let pb = ProgressBar::new(file_size);
         pb.set_style(ProgressStyle::default_bar()
@@ -202,115 +221,114 @@ fn encrypt_file_to_path(filepath: &Path, key: &[u8; 32], encrypted_path: &Path) 
         None
     };
 
-    // Leggi file
     let mut file = File::open(filepath)?;
-    let mut buffer = Vec::new();
     
+    // Construct the payload buffer: [Len (4b)][Name Bytes][Content]
+    // Reserve memory: 4 + name_len + file_size
+    let mut payload = Vec::with_capacity(4 + filename_bytes.len() + file_size as usize);
+    
+    // Write Header
+    payload.extend_from_slice(&filename_len.to_le_bytes());
+    payload.extend_from_slice(filename_bytes);
+
+    // Write Content
     if let Some(pb) = &progress {
         let mut chunk = vec![0u8; CHUNK_SIZE];
         loop {
             let n = file.read(&mut chunk)?;
             if n == 0 { break; }
-            buffer.extend_from_slice(&chunk[..n]);
+            payload.extend_from_slice(&chunk[..n]);
             pb.inc(n as u64);
         }
         pb.finish_and_clear();
     } else {
-        file.read_to_end(&mut buffer)?;
+        file.read_to_end(&mut payload)?;
     }
 
-    // Setup cipher
+    // 3. Encrypt
     let cipher = ChaCha20Poly1305::new(key.into());
     
-    // Genera nonce unico
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    // Cripta
     let ciphertext = cipher
-        .encrypt(nonce, buffer.as_ref())
+        .encrypt(nonce, payload.as_ref())
         .map_err(|e| format!("Errore di crittografia: {}", e))?;
 
-    // Combina nonce + ciphertext
-    let mut encrypted_data = nonce_bytes.to_vec();
-    encrypted_data.extend_from_slice(&ciphertext);
+    // 4. Save to Disk: [Nonce][Ciphertext]
+    let mut final_data = nonce_bytes.to_vec();
+    final_data.extend_from_slice(&ciphertext);
     
-    fs::write(encrypted_path, encrypted_data)?;
+    fs::write(&encrypted_path, final_data)?;
     
-    // Rimuovi file originale
+    // Remove original file
     fs::remove_file(filepath)?;
     
-    println!("✓ Criptato: {} → {}", filepath.display(), encrypted_path.display());
+    println!("✓ Criptato: {} → {}", filepath.file_name().unwrap_or_default().to_string_lossy(), encrypted_path.file_name().unwrap().to_string_lossy());
     
     Ok(())
 }
 
 fn decrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
-    let metadata = fs::metadata(filepath)?;
-    let file_size = metadata.len();
-    
-    println!("Decriptando: {}", filepath.display());
-    
-    let progress = if file_size > PROGRESS_THRESHOLD {
-        let pb = ProgressBar::new(file_size);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
-            .progress_chars("#>-"));
-        Some(pb)
-    } else {
-        None
-    };
 
-    // Leggi file criptato
+    println!("Elaborazione: {}", filepath.display());
+
+    // Read encrypted file
     let encrypted_data = fs::read(filepath)?;
-    
-    if let Some(pb) = &progress {
-        pb.inc(file_size);
-        pb.finish_and_clear();
-    }
-    
-    if encrypted_data.len() < 12 {
-        return Err("File criptato corrotto o troppo piccolo".into());
+
+    if encrypted_data.len() < 12 + 4 { // Nonce + Len + min
+        return Err("File troppo piccolo o corrotto".into());
     }
 
     // Setup cipher
     let cipher = ChaCha20Poly1305::new(key.into());
     
-    // Estrai nonce e ciphertext
+    // Split Nonce and Ciphertext
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    // Decripta
+    // Decrypt
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| "Decrittografia fallita: password errata o file corrotto")?;
+        .map_err(|_| "Decrittografia fallita: chiave errata o dati corrotti")?;
 
-    // Determina nome file originale (rimuovi .encrypted)
-    let mut original_path = if let Some(stem) = filepath.file_stem() {
-        let stem_str = stem.to_string_lossy();
-        if let Some(pos) = stem_str.rfind('.') {
-            filepath.with_file_name(format!("{}.{}", 
-                &stem_str[..pos],
-                &stem_str[pos+1..]
-            ))
-        } else {
-            filepath.with_file_name(stem)
-        }
-    } else {
-        return Err("Nome file non valido".into());
-    };
+    // --- Parse Payload ---
+    // Format: [Len (4B u32 LE)][Name][Content]
+    
+    if plaintext.len() < 4 {
+        return Err("Payload non valido (header mancante)".into());
+    }
 
-    // Genera path unico se esiste già
+    let name_len_bytes: [u8; 4] = plaintext[..4].try_into()?;
+    let name_len = u32::from_le_bytes(name_len_bytes) as usize;
+
+    if plaintext.len() < 4 + name_len {
+        return Err("Payload non valido (nome troncato)".into());
+    }
+
+    // Extract original filename
+    let name_bytes = &plaintext[4..4+name_len];
+    let original_name = std::str::from_utf8(name_bytes)
+        .map_err(|_| "Nome file originale non è UTF-8 valido")?;
+
+    // Extract content
+    let content = &plaintext[4+name_len..];
+
+    // Determine output path
+    let parent_dir = filepath.parent().unwrap_or_else(|| Path::new("."));
+    let mut original_path = parent_dir.join(original_name);
+
+    // Check collision
     original_path = get_unique_path(original_path)?;
 
-    // Salva file decriptato
-    fs::write(&original_path, plaintext)?;
+    // Write decrypted file
+    fs::write(&original_path, content)?;
     
-    // Rimuovi file criptato
+    // Remove encrypted file
     fs::remove_file(filepath)?;
     
-    println!("✓ Decriptato: {} → {}", filepath.display(), original_path.display());
+    println!("✓ Ripristinato: {}", original_path.display());
     
     Ok(())
 }
@@ -319,7 +337,7 @@ fn protect_key_with_password(key: &[u8; 32], password: &str) -> Result<Vec<u8>, 
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     
-    // Deriva chiave da password usando Argon2id
+    // Derive Key
     let password_hash = argon2
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| format!("Errore hash password: {}", e))?;
@@ -328,23 +346,20 @@ fn protect_key_with_password(key: &[u8; 32], password: &str) -> Result<Vec<u8>, 
         .ok_or("Hash non generato")?;
     let derived_key_bytes = hash_output.as_bytes();
     
-    // Usa i primi 32 byte come chiave per ChaCha20
     let mut derived_key = [0u8; 32];
     derived_key.copy_from_slice(&derived_key_bytes[..32]);
     
     let cipher = ChaCha20Poly1305::new(&derived_key.into());
     
-    // Genera nonce
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     
-    // Cripta la chiave master
     let ciphertext = cipher
         .encrypt(nonce, key.as_ref())
         .map_err(|e| format!("Errore protezione chiave: {}", e))?;
     
-    // Formato: salt (22 bytes) + nonce (12 bytes) + ciphertext
+    // Format: Salt (22) + Nonce (12) + Ciphertext
     let mut result = Vec::new();
     result.extend_from_slice(salt.as_str().as_bytes());
     result.extend_from_slice(&nonce_bytes);
@@ -358,7 +373,6 @@ fn recover_key_from_password(protected_key: &[u8], password: &str) -> Result<[u8
         return Err("Chiave protetta non valida".into());
     }
     
-    // Estrai componenti
     let salt_str = std::str::from_utf8(&protected_key[..22])?;
     let salt = SaltString::from_b64(salt_str)
         .map_err(|e| format!("Salt non valido: {}", e))?;
@@ -367,7 +381,6 @@ fn recover_key_from_password(protected_key: &[u8], password: &str) -> Result<[u8
     
     let argon2 = Argon2::default();
     
-    // Deriva chiave da password
     let password_hash = argon2
         .hash_password(password.as_bytes(), &salt)
         .map_err(|_| "Password errata")?;
@@ -382,7 +395,6 @@ fn recover_key_from_password(protected_key: &[u8], password: &str) -> Result<[u8
     let cipher = ChaCha20Poly1305::new(&derived_key.into());
     let nonce = Nonce::from_slice(nonce_bytes);
     
-    // Decripta la chiave master
     let key_bytes = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| "Password errata o chiave corrotta")?;
@@ -418,7 +430,6 @@ fn get_unique_path(path: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>>
     let extension = path.extension()
         .and_then(|s| s.to_str());
     
-    // Cerca un numero incrementale libero
     for i in 1..10000 {
         let new_name = if let Some(ext) = extension {
             format!("{}_{}.{}", stem, i, ext)
@@ -429,52 +440,6 @@ fn get_unique_path(path: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>>
         let new_path = parent.join(new_name);
         if !new_path.exists() {
             return Ok(new_path);
-        }
-    }
-    
-    Err("Troppi file duplicati (limite 10000)".into())
-}
-
-fn find_paired_unique_paths(encrypted_base: PathBuf, key_base: PathBuf) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
-    // Se nessuno esiste, usa i path base
-    if !encrypted_base.exists() && !key_base.exists() {
-        return Ok((encrypted_base, key_base));
-    }
-    
-    let enc_parent = encrypted_base.parent().ok_or("Path non valido")?;
-    let enc_stem = encrypted_base.file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("Nome file non valido")?;
-    let enc_ext = encrypted_base.extension()
-        .and_then(|s| s.to_str());
-    
-    let key_parent = key_base.parent().ok_or("Path non valido")?;
-    let key_stem = key_base.file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("Nome file non valido")?;
-    let key_ext = key_base.extension()
-        .and_then(|s| s.to_str());
-    
-    // Cerca una coppia di numeri liberi
-    for i in 1..10000 {
-        let enc_name = if let Some(ext) = enc_ext {
-            format!("{}_{}.{}", enc_stem, i, ext)
-        } else {
-            format!("{}_{}", enc_stem, i)
-        };
-        
-        let key_name = if let Some(ext) = key_ext {
-            format!("{}_{}.{}", key_stem, i, ext)
-        } else {
-            format!("{}_{}", key_stem, i)
-        };
-        
-        let enc_path = enc_parent.join(&enc_name);
-        let key_path = key_parent.join(&key_name);
-        
-        // Entrambi devono essere liberi
-        if !enc_path.exists() && !key_path.exists() {
-            return Ok((enc_path, key_path));
         }
     }
     
