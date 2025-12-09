@@ -121,14 +121,17 @@ fn encrypt_entry_point(path_str: &str) -> Result<(), Box<dyn std::error::Error>>
     println!("Master Key saved to: {}", final_key_path.display());
     println!("IMPORTANT: Keep this key safe. You cannot recover data without it.");
 
-    if path.is_file() {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_file() {
         if let Err(e) = encrypt_file(path, &master_key) {
              eprintln!("Encryption failed: {}", e);
         }
-    } else if path.is_dir() {
+    } else if metadata.is_dir() {
         if let Err(e) = encrypt_directory_recursive(path, &master_key, 0) {
             eprintln!("Encryption process encountered errors: {}", e);
         }
+    } else {
+        eprintln!("Target is neither a regular file nor a directory.");
     }
 
     Ok(())
@@ -151,16 +154,20 @@ fn decrypt_entry_point(path_str: &str, keyfile_str: &str) -> Result<(), Box<dyn 
     println!("Password correct. Starting decryption...");
 
     let mut stats = EncryptionStats { total: 0, success: 0, errors: Vec::new() };
+    
+    let metadata = fs::symlink_metadata(path)?;
 
-    if path.is_file() {
+    if metadata.is_file() {
         stats.total = 1;
         match decrypt_file(path, &master_key) {
             Ok(_) => stats.success += 1,
             Err(e) => stats.errors.push(format!("File {}: {}", path.display(), e)),
         }
-    } else if path.is_dir() {
+    } else if metadata.is_dir() {
         stats.total = WalkDir::new(path).into_iter().count(); 
         decrypt_directory_recursive(path, &master_key, &mut stats, 0)?;
+    } else {
+        return Err("Target type not supported".into());
     }
 
     if !stats.errors.is_empty() {
@@ -194,9 +201,11 @@ fn encrypt_directory_recursive(path: &Path, key: &SecureKey, depth: usize) -> Re
         .collect();
 
     for entry in entries {
-        if entry.is_dir() {
+        let symlink_meta = fs::symlink_metadata(&entry)?;
+        
+        if symlink_meta.is_dir() {
             encrypt_directory_recursive(&entry, key, depth + 1)?;
-        } else {
+        } else if symlink_meta.is_file() {
             encrypt_file(&entry, key)?;
         }
     }
@@ -243,7 +252,11 @@ fn decrypt_directory_recursive(path: &Path, key: &SecureKey, stats: &mut Encrypt
                     .map_err(|_| "Invalid UTF-8 in directory name")?;
                 
                 let parent = path.parent().unwrap_or(Path::new("."));
-                let new_path = get_unique_path(parent.join(&original_name))?;
+                let safe_dir_name = Path::new(&original_name)
+                    .file_name()
+                    .ok_or("Invalid directory name in metadata")?;
+                
+                let new_path = get_unique_path(parent.join(safe_dir_name))?;
 
                 fs::rename(path, &new_path)?;
                 
@@ -275,13 +288,23 @@ fn decrypt_directory_recursive(path: &Path, key: &SecureKey, stats: &mut Encrypt
     };
 
     for entry in entries {
-        if entry.is_dir() {
+        let symlink_meta = match fs::symlink_metadata(&entry) {
+            Ok(m) => m,
+            Err(e) => {
+                stats.errors.push(format!("Cannot read metadata {}: {}", entry.display(), e));
+                continue;
+            }
+        };
+
+        if symlink_meta.is_dir() {
             decrypt_directory_recursive(&entry, key, stats, depth + 1)?;
-        } else if entry.extension().and_then(|s| s.to_str()) == Some("enc") {
-             match decrypt_file(&entry, key) {
-                 Ok(_) => stats.success += 1,
-                 Err(e) => stats.errors.push(format!("File {}: {}", entry.display(), e)),
-             }
+        } else if symlink_meta.is_file() {
+            if entry.extension().and_then(|s| s.to_str()) == Some("enc") {
+                 match decrypt_file(&entry, key) {
+                     Ok(_) => stats.success += 1,
+                     Err(e) => stats.errors.push(format!("File {}: {}", entry.display(), e)),
+                 }
+            }
         }
     }
 
@@ -292,7 +315,6 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let metadata = fs::metadata(filepath)?;
     let file_size = metadata.len();
     
-    // Generate random filename for the encrypted output
     let random_name: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(16)
@@ -302,7 +324,6 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let parent_dir = filepath.parent().unwrap_or(Path::new("."));
     let final_path = parent_dir.join(encrypted_filename);
 
-    // Prevent overwriting existing files with the same random name (unlikely but safe)
     if final_path.exists() {
         return encrypt_file(filepath, key); 
     }
@@ -313,7 +334,6 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let mut dest_file = File::create(&final_path)?;
     let mut hasher = Sha256::new();
 
-    // Generate and write file salt
     let mut file_salt = [0u8; 20];
     OsRng.fill_bytes(&mut file_salt);
     dest_file.write_all(&file_salt)?;
@@ -321,7 +341,6 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let mut chunk_counter: u32 = 0;
 
-    // Encrypt filename metadata
     let original_filename = filepath.file_name()
         .ok_or("Invalid filename")?
         .to_string_lossy()
@@ -334,13 +353,11 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let encrypted_metadata = cipher.encrypt(&nonce, filename_bytes)
         .map_err(|e| format!("Encryption error (metadata): {}", e))?;
     
-    // Write metadata block
     dest_file.write_all(&[CHUNK_TYPE_DATA])?;
     let meta_len = encrypted_metadata.len() as u32;
     dest_file.write_all(&meta_len.to_le_bytes())?;
     dest_file.write_all(&encrypted_metadata)?;
 
-    // Setup Progress Bar
     let pb = if file_size > PROGRESS_THRESHOLD {
         let p = ProgressBar::new(file_size);
         p.set_style(ProgressStyle::default_bar()
@@ -354,13 +371,10 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let mut buffer = vec![0u8; CHUNK_SIZE];
     
     loop {
-        // Some zeroize implementations might affect length, or previous loop logic might have sliced it.
-        // This ensures read() always has space to write to.
         if buffer.len() < CHUNK_SIZE {
             buffer.resize(CHUNK_SIZE, 0);
         }
 
-        // This prevents creating tiny chunks if the OS returns a partial read.
         let mut read_count = 0;
         while read_count < CHUNK_SIZE {
             let n = source_file.read(&mut buffer[read_count..])?;
@@ -370,7 +384,6 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
 
         if read_count == 0 { break; }
 
-        // Calculate hash of the plaintext chunk
         hasher.update(&buffer[..read_count]);
 
         let nonce = create_nonce(&file_salt, chunk_counter);
@@ -378,13 +391,11 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
         let ciphertext = cipher.encrypt(&nonce, &buffer[..read_count])
             .map_err(|e| format!("Encryption error (chunk {}): {}", chunk_counter, e))?;
 
-        // Write chunk to disk
         dest_file.write_all(&[CHUNK_TYPE_DATA])?;
         let chunk_len = ciphertext.len() as u32;
         dest_file.write_all(&chunk_len.to_le_bytes())?;
         dest_file.write_all(&ciphertext)?;
 
-        // Securely clear the buffer memory
         buffer.zeroize();
 
         if let Some(ref p) = pb {
@@ -398,19 +409,16 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
         p.finish_and_clear();
     }
 
-    // Finalize Integrity Hash
     let final_hash = hasher.finalize();
     let nonce = create_nonce(&file_salt, chunk_counter);
     let encrypted_hash = cipher.encrypt(&nonce, final_hash.as_slice())
         .map_err(|e| format!("Encryption error (hash): {}", e))?;
     
-    // Write EOF block
     dest_file.write_all(&[CHUNK_TYPE_EOF])?;
     dest_file.write_all(&encrypted_hash)?;
 
     dest_file.sync_all()?;
     
-    // Cleanup source file
     drop(source_file);
     secure_delete(filepath)?;
     
@@ -434,7 +442,6 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let mut hasher = Sha256::new();
     let mut type_buf = [0u8; 1];
 
-    // Read metadata header
     source_file.read_exact(&mut type_buf)?;
     if type_buf[0] != CHUNK_TYPE_DATA {
          return Err("Invalid file structure: Expected metadata block".into());
@@ -455,8 +462,12 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let filename_bytes = cipher.decrypt(&nonce, meta_ciphertext.as_ref())
         .map_err(|_| "Decryption failed (Metadata): Wrong key or corrupt header")?;
     
-    let original_name = String::from_utf8(filename_bytes)
+    let original_name_string = String::from_utf8(filename_bytes)
         .map_err(|_| "Invalid UTF-8 in filename")?;
+
+    let original_name = Path::new(&original_name_string)
+        .file_name()
+        .ok_or("Invalid filename in metadata")?;
 
     let parent_dir = filepath.parent().unwrap_or(Path::new("."));
     let mut final_path = parent_dir.join(original_name);
@@ -473,7 +484,6 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let mut dest_file = File::create(&temp_path)?;
     let mut integrity_verified = false;
 
-    // Optimization: Reusable buffer for ciphertext reading to avoid allocation loop
     let mut ciphertext_buffer = Vec::with_capacity(CHUNK_SIZE + 1024);
 
     loop {
@@ -483,7 +493,6 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
         if type_buf[0] == CHUNK_TYPE_EOF {
             let nonce = create_nonce(&file_salt, chunk_counter);
             
-            // Expected hash length: 32 bytes (SHA256) + 16 bytes (Poly1305 tag)
             let hash_len = 32 + 16; 
             let mut hash_ciphertext = vec![0u8; hash_len];
             source_file.read_exact(&mut hash_ciphertext)?;
@@ -511,12 +520,10 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
                 return Err("Invalid chunk size".into()); 
             }
 
-            // Ensure buffer has enough space for the incoming chunk
             if ciphertext_buffer.len() < chunk_len {
                 ciphertext_buffer.resize(chunk_len, 0);
             }
 
-            // Read exactly chunk_len bytes into the buffer
             source_file.read_exact(&mut ciphertext_buffer[..chunk_len])?;
 
             let nonce = create_nonce(&file_salt, chunk_counter);
@@ -527,7 +534,6 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
             hasher.update(&plaintext);
             dest_file.write_all(&plaintext)?;
             
-            // Securely clear the plaintext from memory
             plaintext.zeroize();
             
             chunk_counter = chunk_counter.checked_add(1).ok_or("Counter overflow")?;
@@ -684,13 +690,19 @@ fn get_unique_path(path: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>>
 }
 
 fn secure_delete(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    
+    if metadata.file_type().is_symlink() {
+        fs::remove_file(path)?;
+        return Ok(());
+    }
+
     let len = metadata.len();
     
     {
         let mut file = OpenOptions::new().write(true).open(path)?;
         let mut rng = OsRng;
-        let buffer_size = 4096 * 1024; // 4MB chunks
+        let buffer_size = 4096 * 1024; 
         let mut buffer = vec![0u8; buffer_size];
         let mut written_bytes = 0;
 
