@@ -13,10 +13,28 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
+use sha2::{Sha256, Digest};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-// Configuration
-const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
-const PROGRESS_THRESHOLD: u64 = 1024 * 1024; // 1MB
+const CHUNK_SIZE: usize = 4096 * 1024;
+const PROGRESS_THRESHOLD: u64 = 1024 * 1024;
+const CHUNK_TYPE_DATA: u8 = 0;
+const CHUNK_TYPE_EOF: u8 = 1;
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct SecureKey {
+    key: [u8; 32],
+}
+
+impl SecureKey {
+    fn new(data: [u8; 32]) -> Self {
+        Self { key: data }
+    }
+    
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.key
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -49,8 +67,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// --- Entry Points ---
-
 fn encrypt_entry_point(path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(path_str);
     
@@ -58,22 +74,22 @@ fn encrypt_entry_point(path_str: &str) -> Result<(), Box<dyn std::error::Error>>
         return Err("Path does not exist".into());
     }
 
-    // Password setup
-    let password = read_password("Enter password to protect the key: ")?;
-    let password_confirm = read_password("Confirm password: ")?;
+    let mut password = read_password("Enter password to protect the key: ")?;
+    let mut password_confirm = read_password("Confirm password: ")?;
     
     if password != password_confirm {
         return Err("Passwords do not match".into());
     }
 
-    // Generate master key
-    let mut master_key = [0u8; 32];
-    OsRng.fill_bytes(&mut master_key);
+    let mut master_key_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut master_key_bytes);
+    let master_key = SecureKey::new(master_key_bytes);
 
-    // Encrypt the master key itself
     let protected_key = protect_key_with_password(&master_key, &password)?;
     
-    // Determine key location
+    password.zeroize();
+    password_confirm.zeroize();
+    
     let key_path = if path.is_dir() {
         let parent = path.parent().unwrap_or(Path::new("."));
         let stem = path.file_stem().unwrap_or(path.as_os_str());
@@ -86,7 +102,6 @@ fn encrypt_entry_point(path_str: &str) -> Result<(), Box<dyn std::error::Error>>
 
     let final_key_path = get_unique_path(key_path)?;
 
-    // Write key to disk immediately before processing files
     {
         let mut key_file = File::create(&final_key_path)?;
         key_file.write_all(&protected_key)?;
@@ -96,7 +111,6 @@ fn encrypt_entry_point(path_str: &str) -> Result<(), Box<dyn std::error::Error>>
     println!("Master Key saved to: {}", final_key_path.display());
     println!("IMPORTANT: Keep this key safe. You cannot recover data without it.");
 
-    // Start Encryption
     if path.is_file() {
         if let Err(e) = encrypt_file(path, &master_key) {
              eprintln!("Encryption failed: {}", e);
@@ -118,16 +132,16 @@ fn decrypt_entry_point(path_str: &str, keyfile_str: &str) -> Result<(), Box<dyn 
         return Err("Target path or key file not found".into());
     }
 
-    // Load Key
     let protected_key = fs::read(key_path)?;
-    let password = read_password("Enter password: ")?;
+    let mut password = read_password("Enter password: ")?;
+    
     let master_key = recover_key_from_password(&protected_key, &password)?;
+    password.zeroize();
 
     println!("Password correct. Starting decryption...");
 
     let mut stats = EncryptionStats { total: 0, success: 0, errors: Vec::new() };
 
-    // Decrypt
     if path.is_file() {
         stats.total = 1;
         match decrypt_file(path, &master_key) {
@@ -139,7 +153,6 @@ fn decrypt_entry_point(path_str: &str, keyfile_str: &str) -> Result<(), Box<dyn 
         decrypt_directory_recursive(path, &master_key, &mut stats)?;
     }
 
-    // Final Report
     if !stats.errors.is_empty() {
         println!("\nERRORS encountered:");
         for e in &stats.errors {
@@ -161,10 +174,7 @@ struct EncryptionStats {
     errors: Vec<String>,
 }
 
-// --- Recursive Logic ---
-
-fn encrypt_directory_recursive(path: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
-    // Process contents FIRST (Bottom-Up)
+fn encrypt_directory_recursive(path: &Path, key: &SecureKey) -> Result<(), Box<dyn std::error::Error>> {
     let entries: Vec<PathBuf> = fs::read_dir(path)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .collect();
@@ -177,7 +187,6 @@ fn encrypt_directory_recursive(path: &Path, key: &[u8; 32]) -> Result<(), Box<dy
         }
     }
 
-    // Create Directory Marker
     let original_name = path.file_name()
         .ok_or("Invalid directory name")?
         .to_string_lossy()
@@ -188,7 +197,6 @@ fn encrypt_directory_recursive(path: &Path, key: &[u8; 32]) -> Result<(), Box<dy
     let marker_path = path.join(".dirname.enc");
     fs::write(&marker_path, name_ciphertext)?;
 
-    // Rename Directory
     let random_name: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(16)
@@ -204,8 +212,7 @@ fn encrypt_directory_recursive(path: &Path, key: &[u8; 32]) -> Result<(), Box<dy
     Ok(())
 }
 
-fn decrypt_directory_recursive(path: &Path, key: &[u8; 32], stats: &mut EncryptionStats) -> Result<(), Box<dyn std::error::Error>> {
-    // Check for Directory Marker (Top-Down)
+fn decrypt_directory_recursive(path: &Path, key: &SecureKey, stats: &mut EncryptionStats) -> Result<(), Box<dyn std::error::Error>> {
     let marker_path = path.join(".dirname.enc");
     
     let current_path = if marker_path.exists() {
@@ -234,7 +241,6 @@ fn decrypt_directory_recursive(path: &Path, key: &[u8; 32], stats: &mut Encrypti
         path.to_path_buf()
     };
 
-    // Process contents
     let entries: Vec<PathBuf> = match fs::read_dir(&current_path) {
         Ok(iter) => iter.filter_map(|e| e.ok().map(|e| e.path())).collect(),
         Err(e) => {
@@ -257,13 +263,10 @@ fn decrypt_directory_recursive(path: &Path, key: &[u8; 32], stats: &mut Encrypti
     Ok(())
 }
 
-// --- File Logic (Streaming / Chunked / XChaCha) ---
-
-fn encrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
+fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::error::Error>> {
     let metadata = fs::metadata(filepath)?;
     let file_size = metadata.len();
     
-    // Output path setup
     let random_name: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(16)
@@ -281,17 +284,15 @@ fn encrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::erro
 
     let mut source_file = File::open(filepath)?;
     let mut dest_file = File::create(&final_path)?;
+    let mut hasher = Sha256::new();
 
-    // Generate a file-unique salt (20 bytes for XChaCha construction)
-    // Nonce(24) = Salt(20) + Counter(4)
     let mut file_salt = [0u8; 20];
     OsRng.fill_bytes(&mut file_salt);
     dest_file.write_all(&file_salt)?;
 
-    let cipher = XChaCha20Poly1305::new(key.into());
+    let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let mut chunk_counter: u32 = 0;
 
-    // Encrypt Metadata (Filename) as Chunk 0
     let original_filename = filepath.file_name()
         .ok_or("Invalid filename")?
         .to_string_lossy()
@@ -304,12 +305,11 @@ fn encrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::erro
     let encrypted_metadata = cipher.encrypt(&nonce, filename_bytes)
         .map_err(|e| format!("Encryption error (metadata): {}", e))?;
     
-    // Write Metadata Block: [Len(4)][Ciphertext]
+    dest_file.write_all(&[CHUNK_TYPE_DATA])?;
     let meta_len = encrypted_metadata.len() as u32;
     dest_file.write_all(&meta_len.to_le_bytes())?;
     dest_file.write_all(&encrypted_metadata)?;
 
-    // Encrypt Content (Streaming)
     let pb = if file_size > PROGRESS_THRESHOLD {
         let p = ProgressBar::new(file_size);
         p.set_style(ProgressStyle::default_bar()
@@ -325,12 +325,14 @@ fn encrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::erro
         let read_count = source_file.read(&mut buffer)?;
         if read_count == 0 { break; }
 
+        hasher.update(&buffer[..read_count]);
+
         let nonce = create_nonce(&file_salt, chunk_counter);
         
         let ciphertext = cipher.encrypt(&nonce, &buffer[..read_count])
             .map_err(|e| format!("Encryption error (chunk {}): {}", chunk_counter, e))?;
 
-        // Write Chunk: [Len(4)][Ciphertext]
+        dest_file.write_all(&[CHUNK_TYPE_DATA])?;
         let chunk_len = ciphertext.len() as u32;
         dest_file.write_all(&chunk_len.to_le_bytes())?;
         dest_file.write_all(&ciphertext)?;
@@ -346,15 +348,22 @@ fn encrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::erro
         p.finish_and_clear();
     }
 
-    // Sync and remove original
+    let final_hash = hasher.finalize();
+    let nonce = create_nonce(&file_salt, chunk_counter);
+    let encrypted_hash = cipher.encrypt(&nonce, final_hash.as_slice())
+        .map_err(|e| format!("Encryption error (hash): {}", e))?;
+    
+    dest_file.write_all(&[CHUNK_TYPE_EOF])?;
+    dest_file.write_all(&encrypted_hash)?;
+
     dest_file.sync_all()?;
     fs::remove_file(filepath)?;
     
-    println!("Done: File encrypted.");
+    println!("Done: File encrypted and integrity secured.");
     Ok(())
 }
 
-fn decrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
+fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::error::Error>> {
     println!("Processing: {}", filepath.display());
 
     let mut source_file = File::open(filepath)?;
@@ -362,19 +371,24 @@ fn decrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::erro
 
     if file_len < 20 { return Err("File too small".into()); }
 
-    // Read File Salt (20 bytes)
     let mut file_salt = [0u8; 20];
     source_file.read_exact(&mut file_salt)?;
 
-    let cipher = XChaCha20Poly1305::new(key.into());
+    let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let mut chunk_counter: u32 = 0;
+    let mut hasher = Sha256::new();
+    let mut type_buf = [0u8; 1];
 
-    // Read Metadata Chunk (Chunk 0)
+    source_file.read_exact(&mut type_buf)?;
+    if type_buf[0] != CHUNK_TYPE_DATA {
+         return Err("Invalid file structure: Expected metadata block".into());
+    }
+
     let mut len_buf = [0u8; 4];
     source_file.read_exact(&mut len_buf)?;
     let meta_len = u32::from_le_bytes(len_buf) as usize;
     
-    if meta_len > 4096 { return Err("Metadata header too large, file likely corrupt".into()); }
+    if meta_len > 4096 { return Err("Metadata header too large".into()); }
 
     let mut meta_ciphertext = vec![0u8; meta_len];
     source_file.read_exact(&mut meta_ciphertext)?;
@@ -388,45 +402,73 @@ fn decrypt_file(filepath: &Path, key: &[u8; 32]) -> Result<(), Box<dyn std::erro
     let original_name = String::from_utf8(filename_bytes)
         .map_err(|_| "Invalid UTF-8 in filename")?;
 
-    // Prepare Output
     let parent_dir = filepath.parent().unwrap_or(Path::new("."));
     let mut original_path = parent_dir.join(original_name);
     original_path = get_unique_path(original_path)?;
     
     let mut dest_file = File::create(&original_path)?;
+    let mut integrity_verified = false;
 
-    // Decrypt Content Chunks
     loop {
-        let bytes_read = source_file.read(&mut len_buf)?;
+        let bytes_read = source_file.read(&mut type_buf)?;
         if bytes_read == 0 { break; } 
-        if bytes_read < 4 { return Err("Truncated chunk header".into()); }
 
-        let chunk_len = u32::from_le_bytes(len_buf) as usize;
-        if chunk_len > CHUNK_SIZE + 1024 { return Err("Invalid chunk size detected".into()); }
+        if type_buf[0] == CHUNK_TYPE_EOF {
+            let nonce = create_nonce(&file_salt, chunk_counter);
+            
+            let hash_len = 32 + 16; 
+            let mut hash_ciphertext = vec![0u8; hash_len];
+            source_file.read_exact(&mut hash_ciphertext)?;
 
-        let mut chunk_ciphertext = vec![0u8; chunk_len];
-        source_file.read_exact(&mut chunk_ciphertext)?;
+            let stored_hash = cipher.decrypt(&nonce, hash_ciphertext.as_ref())
+                .map_err(|_| "Integrity Check Failed: Footer corrupted")?;
 
-        let nonce = create_nonce(&file_salt, chunk_counter);
-        
-        let plaintext = cipher.decrypt(&nonce, chunk_ciphertext.as_ref())
-            .map_err(|_| format!("Decryption failed at chunk {}", chunk_counter))?;
-        
-        dest_file.write_all(&plaintext)?;
-        
-        chunk_counter = chunk_counter.checked_add(1).ok_or("Counter overflow")?;
+            let calculated_hash = hasher.finalize();
+
+            if stored_hash.as_slice() != calculated_hash.as_slice() {
+                drop(dest_file);
+                fs::remove_file(&original_path)?;
+                return Err("CRITICAL: Integrity Mismatch. File content has been modified or truncated.".into());
+            }
+            
+            integrity_verified = true;
+            break; 
+        } else if type_buf[0] == CHUNK_TYPE_DATA {
+            source_file.read_exact(&mut len_buf)?;
+            let chunk_len = u32::from_le_bytes(len_buf) as usize;
+            
+            if chunk_len > CHUNK_SIZE + 1024 { return Err("Invalid chunk size".into()); }
+
+            let mut chunk_ciphertext = vec![0u8; chunk_len];
+            source_file.read_exact(&mut chunk_ciphertext)?;
+
+            let nonce = create_nonce(&file_salt, chunk_counter);
+            
+            let plaintext = cipher.decrypt(&nonce, chunk_ciphertext.as_ref())
+                .map_err(|_| format!("Decryption failed at chunk {}", chunk_counter))?;
+            
+            hasher.update(&plaintext);
+            dest_file.write_all(&plaintext)?;
+            
+            chunk_counter = chunk_counter.checked_add(1).ok_or("Counter overflow")?;
+        } else {
+            return Err("Unknown chunk type found".into());
+        }
+    }
+
+    if !integrity_verified {
+        drop(dest_file);
+        fs::remove_file(&original_path)?;
+        return Err("CRITICAL: Truncated file. Integrity footer missing.".into());
     }
 
     dest_file.sync_all()?;
     fs::remove_file(filepath)?;
-    println!("Restored: {}", original_path.file_name().unwrap_or_default().to_string_lossy());
+    println!("Restored and Verified: {}", original_path.file_name().unwrap_or_default().to_string_lossy());
 
     Ok(())
 }
 
-// --- Helpers ---
-
-// XChaCha20 uses 24-byte nonces. We combine a random 20-byte salt + 4-byte counter.
 fn create_nonce(salt: &[u8; 20], counter: u32) -> XNonce {
     let mut nonce_bytes = [0u8; 24];
     nonce_bytes[..20].copy_from_slice(salt);
@@ -434,9 +476,8 @@ fn create_nonce(salt: &[u8; 20], counter: u32) -> XNonce {
     *XNonce::from_slice(&nonce_bytes)
 }
 
-fn simple_encrypt_data(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let cipher = XChaCha20Poly1305::new(key.into());
-    // XChaCha needs 24 bytes nonce. For simple data, we generate fully random 24 bytes.
+fn simple_encrypt_data(data: &[u8], key: &SecureKey) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let mut nonce_bytes = [0u8; 24];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
@@ -449,10 +490,10 @@ fn simple_encrypt_data(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, Box<dyn s
     Ok(result)
 }
 
-fn simple_decrypt_data(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn simple_decrypt_data(data: &[u8], key: &SecureKey) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if data.len() < 24 { return Err("Data too short".into()); }
     
-    let cipher = XChaCha20Poly1305::new(key.into());
+    let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let (nonce_bytes, ciphertext) = data.split_at(24);
     let nonce = XNonce::from_slice(nonce_bytes);
 
@@ -460,17 +501,10 @@ fn simple_decrypt_data(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, Box<dyn s
         .map_err(|_| "Decryption failed".into())
 }
 
-fn protect_key_with_password(key: &[u8; 32], password: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn protect_key_with_password(key: &SecureKey, password: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let salt = SaltString::generate(&mut OsRng);
     
-    // Argon2 Hardening: Use custom parameters instead of default
-    let params = Params::new(
-        65536,  // m_cost: 64 MB
-        4,      // t_cost: 4 passes
-        4,      // p_cost: 4 lanes
-        None    // output len (default)
-    ).map_err(|e| format!("Argon2 params error: {}", e))?;
-    
+    let params = Params::new(65536, 4, 4, None).map_err(|e| format!("Argon2 params error: {}", e))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     
     let password_hash = argon2
@@ -478,29 +512,36 @@ fn protect_key_with_password(key: &[u8; 32], password: &str) -> Result<Vec<u8>, 
         .map_err(|e| format!("Hash error: {}", e))?;
     
     let derived_key_bytes = password_hash.hash.ok_or("Hash failed")?;
-    
     let mut derived_key = [0u8; 32];
     derived_key.copy_from_slice(&derived_key_bytes.as_bytes()[..32]);
+    let secure_derived = SecureKey::new(derived_key);
     
-    let protected = simple_encrypt_data(key, &derived_key)?;
+    let protected = simple_encrypt_data(key.as_bytes(), &secure_derived)?;
     
+    let salt_str = salt.as_str();
+    let salt_len = salt_str.len() as u32;
+
     let mut result = Vec::new();
-    result.extend_from_slice(salt.as_str().as_bytes());
+    result.extend_from_slice(&salt_len.to_le_bytes());
+    result.extend_from_slice(salt_str.as_bytes());
     result.extend_from_slice(&protected);
     
     Ok(result)
 }
 
-fn recover_key_from_password(protected_key: &[u8], password: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    if protected_key.len() < 22 { return Err("Invalid key file".into()); }
+fn recover_key_from_password(protected_key: &[u8], password: &str) -> Result<SecureKey, Box<dyn std::error::Error>> {
+    if protected_key.len() < 4 { return Err("Invalid key file format".into()); }
     
-    let salt_str = std::str::from_utf8(&protected_key[..22])?;
+    let (len_bytes, rest) = protected_key.split_at(4);
+    let salt_len = u32::from_le_bytes(len_bytes.try_into()?) as usize;
+    
+    if rest.len() < salt_len { return Err("Key file truncated".into()); }
+    let (salt_bytes, encrypted_master_key) = rest.split_at(salt_len);
+
+    let salt_str = std::str::from_utf8(salt_bytes)?;
     let salt = SaltString::from_b64(salt_str)
         .map_err(|e| format!("Invalid salt: {}", e))?;
     
-    let encrypted_master_key = &protected_key[22..];
-    
-    // Must match the parameters used in encryption
     let params = Params::new(65536, 4, 4, None).unwrap();
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
@@ -511,15 +552,17 @@ fn recover_key_from_password(protected_key: &[u8], password: &str) -> Result<[u8
     let derived_key_bytes = password_hash.hash.ok_or("Hash failed")?;
     let mut derived_key = [0u8; 32];
     derived_key.copy_from_slice(&derived_key_bytes.as_bytes()[..32]);
+    let secure_derived = SecureKey::new(derived_key);
     
-    let decrypted_bytes = simple_decrypt_data(encrypted_master_key, &derived_key)
+    let decrypted_bytes = simple_decrypt_data(encrypted_master_key, &secure_derived)
         .map_err(|_| "Wrong password or corrupted key")?;
     
-    let mut master_key = [0u8; 32];
     if decrypted_bytes.len() != 32 { return Err("Invalid key length".into()); }
-    master_key.copy_from_slice(&decrypted_bytes);
     
-    Ok(master_key)
+    let mut master_key_arr = [0u8; 32];
+    master_key_arr.copy_from_slice(&decrypted_bytes);
+    
+    Ok(SecureKey::new(master_key_arr))
 }
 
 fn read_password(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
