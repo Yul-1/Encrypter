@@ -164,7 +164,16 @@ fn decrypt_entry_point(path_str: &str, keyfile_str: &str) -> Result<(), Box<dyn 
             Err(e) => stats.errors.push(format!("File {}: {}", path.display(), e)),
         }
     } else if metadata.is_dir() {
-        stats.total = WalkDir::new(path).into_iter().count(); 
+        // Count only real data payloads (.enc files), skip directory name markers
+        stats.total = WalkDir::new(path)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.path().extension().and_then(|s| s.to_str()) == Some("enc")
+                    && entry.file_name() != ".dirname.enc"
+            })
+            .count(); 
         decrypt_directory_recursive(path, &master_key, &mut stats, 0)?;
     } else {
         return Err("Target type not supported".into());
@@ -299,6 +308,9 @@ fn decrypt_directory_recursive(path: &Path, key: &SecureKey, stats: &mut Encrypt
         if symlink_meta.is_dir() {
             decrypt_directory_recursive(&entry, key, stats, depth + 1)?;
         } else if symlink_meta.is_file() {
+            if entry.file_name().and_then(|s| s.to_str()) == Some(".dirname.enc") {
+                continue; // skip directory name marker, not a data payload
+            }
             if entry.extension().and_then(|s| s.to_str()) == Some("enc") {
                  match decrypt_file(&entry, key) {
                      Ok(_) => stats.success += 1,
