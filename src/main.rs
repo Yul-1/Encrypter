@@ -101,15 +101,16 @@ fn encrypt_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err("Percorso non valido".into());
     }
 
-    println!("\n⚠️  IMPORTANTE: Conserva la chiave e ricorda la password!");
+    println!("\n  IMPORTANTE: Conserva la chiave e ricorda la password!");
     Ok(())
 }
 
 fn decrypt_path(path: &str, keyfile: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new(path);
+    let path_obj = Path::new(path);
+    let key_path = Path::new(keyfile);
     
     // Leggi chiave protetta
-    let protected_key = fs::read(keyfile)?;
+    let protected_key = fs::read(key_path)?;
     
     // Chiedi password
     let password = read_password("Inserisci password: ")?;
@@ -117,10 +118,18 @@ fn decrypt_path(path: &str, keyfile: &str) -> Result<(), Box<dyn std::error::Err
     // Recupera chiave master
     let master_key = recover_key_from_password(&protected_key, &password)?;
 
-    if path.is_file() {
-        decrypt_file(path, &master_key)?;
-    } else if path.is_dir() {
-        let files: Vec<PathBuf> = WalkDir::new(path)
+    let mut success_count = 0;
+    let mut total_files = 0;
+    let mut errors = Vec::new();
+
+    if path_obj.is_file() {
+        total_files = 1;
+        match decrypt_file(path_obj, &master_key) {
+            Ok(_) => success_count += 1,
+            Err(e) => errors.push(format!("{}: {}", path_obj.display(), e)),
+        }
+    } else if path_obj.is_dir() {
+        let files: Vec<PathBuf> = WalkDir::new(path_obj)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && 
@@ -128,13 +137,37 @@ fn decrypt_path(path: &str, keyfile: &str) -> Result<(), Box<dyn std::error::Err
             .map(|e| e.path().to_path_buf())
             .collect();
 
-        println!("Trovati {} file da decriptare", files.len());
+        total_files = files.len();
+        println!("Trovati {} file da decriptare", total_files);
         
         for file in &files {
-            decrypt_file(file, &master_key)?;
+            match decrypt_file(file, &master_key) {
+                Ok(_) => success_count += 1,
+                Err(e) => errors.push(format!("{}: {}", file.display(), e)),
+            }
         }
     } else {
         return Err("Percorso non valido".into());
+    }
+
+    // Report finale
+    if !errors.is_empty() {
+        println!("\n  Errori riscontrati durante la decrittazione:");
+        for err in &errors {
+            println!("  - {}", err);
+        }
+        println!("\n La chiave NON è stata eliminata perché si sono verificati degli errori.");
+        return Err("Decrittazione completata parzialmente con errori.".into());
+    }
+
+    if total_files > 0 && success_count == total_files {
+        println!("\nVerifica completata: {}/{} file decriptati correttamente.", success_count, total_files);
+        
+        // Rimozione sicura della chiave
+        fs::remove_file(key_path)?;
+        println!("✓ Chiave eliminata definitivamente: {}", key_path.display());
+    } else if total_files == 0 {
+        println!("Nessun file criptato trovato in questo percorso.");
     }
 
     Ok(())
