@@ -4,7 +4,7 @@
 Rust CLI utility to encrypt or decrypt files and directories with XChaCha20-Poly1305 authenticated encryption. A per-user master key is generated, protected with a password via Argon2id, and stored in a `.key` file. File contents, file names, and directory names are encrypted; integrity is verified on decrypt; original plaintext is securely overwritten and removed.
 
 ## Features
-- XChaCha20-Poly1305 streaming encryption with per-file 20-byte salt and per-chunk nonces.
+- XChaCha20-Poly1305 streaming encryption with per-file 16-byte salt and per-chunk nonces.
 - Argon2id key derivation (memory-hard) to protect the master key; key material zeroized in memory.
 - File integrity verification (SHA-256 over plaintext) checked before restoring output.
 - File and directory name encryption; directories are temporarily renamed to random identifiers with `.dirname.enc` markers to recover originals.
@@ -55,11 +55,12 @@ Notes:
 ## Security Notes
 - Memory zeroization is applied to secrets (`Zeroize`/`ZeroizeOnDrop`).
 - Key files are created with restrictive permissions on Unix (0600).
-- Symlinks are not overwritten during secure delete; they are removed directly.
+- Symlinks are skipped during traversal and are not overwritten during secure delete; they are removed directly.
 - Integrity is verified before restoring plaintext; failures leave temp files wiped.
 - Path traversal protections and symlink handling were reinforced in 0.5.4.
 
 ## Version History
+- 0.5.6: Switched to 16-byte salts with 64-bit chunk counters, skipped symlinks during traversal, and hardened key parsing/zeroization.
 - 0.5.5: Skips `.dirname.enc` during decrypt; stats count only real `.enc` payloads.
 - 0.5.4: Hardened traversal and symlink handling to keep operations confined to the target tree.
 - 0.5.3: Fixed critical truncation risk in chunked encryption/decryption read/write loops.

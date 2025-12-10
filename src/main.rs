@@ -211,6 +211,11 @@ fn encrypt_directory_recursive(path: &Path, key: &SecureKey, depth: usize) -> Re
 
     for entry in entries {
         let symlink_meta = fs::symlink_metadata(&entry)?;
+
+        if symlink_meta.file_type().is_symlink() {
+            println!("Skipping symlink: {}", entry.display());
+            continue;
+        }
         
         if symlink_meta.is_dir() {
             encrypt_directory_recursive(&entry, key, depth + 1)?;
@@ -305,6 +310,11 @@ fn decrypt_directory_recursive(path: &Path, key: &SecureKey, stats: &mut Encrypt
             }
         };
 
+        if symlink_meta.file_type().is_symlink() {
+            println!("Skipping symlink: {}", entry.display());
+            continue;
+        }
+
         if symlink_meta.is_dir() {
             decrypt_directory_recursive(&entry, key, stats, depth + 1)?;
         } else if symlink_meta.is_file() {
@@ -324,9 +334,12 @@ fn decrypt_directory_recursive(path: &Path, key: &SecureKey, stats: &mut Encrypt
 }
 
 fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::error::Error>> {
-    let metadata = fs::metadata(filepath)?;
+    let metadata = fs::symlink_metadata(filepath)?;
+    if metadata.file_type().is_symlink() {
+        println!("Skipping symlink: {}", filepath.display());
+        return Ok(());
+    }
     let file_size = metadata.len();
-    
     let random_name: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(16)
@@ -346,12 +359,12 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let mut dest_file = File::create(&final_path)?;
     let mut hasher = Sha256::new();
 
-    let mut file_salt = [0u8; 20];
+    let mut file_salt = [0u8; 16];
     OsRng.fill_bytes(&mut file_salt);
     dest_file.write_all(&file_salt)?;
 
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
-    let mut chunk_counter: u32 = 0;
+    let mut chunk_counter: u64 = 0;
 
     let original_filename = filepath.file_name()
         .ok_or("Invalid filename")?
@@ -360,7 +373,7 @@ fn encrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let filename_bytes = original_filename.as_bytes();
     
     let nonce = create_nonce(&file_salt, chunk_counter);
-    chunk_counter += 1;
+    chunk_counter = chunk_counter.checked_add(1).ok_or("File too large (counter overflow)")?;
 
     let encrypted_metadata = cipher.encrypt(&nonce, filename_bytes)
         .map_err(|e| format!("Encryption error (metadata): {}", e))?;
@@ -444,13 +457,13 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     let mut source_file = File::open(filepath)?;
     let file_len = source_file.metadata()?.len();
 
-    if file_len < 20 { return Err("File too small".into()); }
+    if file_len < 16 { return Err("File too small".into()); }
 
-    let mut file_salt = [0u8; 20];
+    let mut file_salt = [0u8; 16];
     source_file.read_exact(&mut file_salt)?;
 
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
-    let mut chunk_counter: u32 = 0;
+    let mut chunk_counter: u64 = 0;
     let mut hasher = Sha256::new();
     let mut type_buf = [0u8; 1];
 
@@ -469,7 +482,7 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     source_file.read_exact(&mut meta_ciphertext)?;
 
     let nonce = create_nonce(&file_salt, chunk_counter);
-    chunk_counter += 1;
+    chunk_counter = chunk_counter.checked_add(1).ok_or("Counter overflow")?;
 
     let filename_bytes = cipher.decrypt(&nonce, meta_ciphertext.as_ref())
         .map_err(|_| "Decryption failed (Metadata): Wrong key or corrupt header")?;
@@ -578,10 +591,10 @@ fn decrypt_file(filepath: &Path, key: &SecureKey) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn create_nonce(salt: &[u8; 20], counter: u32) -> XNonce {
+fn create_nonce(salt: &[u8; 16], counter: u64) -> XNonce {
     let mut nonce_bytes = [0u8; 24];
-    nonce_bytes[..20].copy_from_slice(salt);
-    nonce_bytes[20..].copy_from_slice(&counter.to_be_bytes());
+    nonce_bytes[..16].copy_from_slice(salt);
+    nonce_bytes[16..].copy_from_slice(&counter.to_be_bytes());
     *XNonce::from_slice(&nonce_bytes)
 }
 
@@ -627,6 +640,8 @@ fn protect_key_with_password(key: &SecureKey, password: &str) -> Result<Vec<u8>,
     
     let protected = simple_encrypt_data(key.as_bytes(), &secure_derived)?;
     
+    derived_key.zeroize();
+    
     let salt_str = salt.as_str();
     let salt_len = salt_str.len() as u32;
 
@@ -643,6 +658,7 @@ fn recover_key_from_password(protected_key: &[u8], password: &str) -> Result<Sec
     
     let (len_bytes, rest) = protected_key.split_at(4);
     let salt_len = u32::from_le_bytes(len_bytes.try_into()?) as usize;
+    if salt_len == 0 || salt_len > 128 { return Err("Invalid salt length".into()); }
     
     if rest.len() < salt_len { return Err("Key file truncated".into()); }
     let (salt_bytes, encrypted_master_key) = rest.split_at(salt_len);
@@ -666,10 +682,15 @@ fn recover_key_from_password(protected_key: &[u8], password: &str) -> Result<Sec
     let decrypted_bytes = simple_decrypt_data(encrypted_master_key, &secure_derived)
         .map_err(|_| "Wrong password or corrupted key")?;
     
+    derived_key.zeroize();
+    
     if decrypted_bytes.len() != 32 { return Err("Invalid key length".into()); }
     
     let mut master_key_arr = [0u8; 32];
     master_key_arr.copy_from_slice(&decrypted_bytes);
+    
+    let mut decrypted_bytes_owned = decrypted_bytes;
+    decrypted_bytes_owned.zeroize();
     
     Ok(SecureKey::new(master_key_arr))
 }
