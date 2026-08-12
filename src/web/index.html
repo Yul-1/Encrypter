@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Encrypt</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<main class="shell">
+  <header>
+    <h1>Encrypt</h1>
+    <p class="lede">XChaCha20-Poly1305 encryption in the browser's reach. Your original file is never modified: the browser uploads a copy, and you download the ciphertext plus its key file.</p>
+  </header>
+
+  <form id="form" autocomplete="off">
+    <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-describedby="dropzone-hint">
+      <p class="dropzone-title">Drop a file here</p>
+      <p id="dropzone-hint" class="dropzone-hint">or click to choose one</p>
+      <p id="selection" class="selection" hidden></p>
+      <input type="file" id="file" name="file" class="visually-hidden">
+    </div>
+
+    <label class="field" for="password">
+      <span>Password</span>
+      <input type="password" id="password" name="password" minlength="12" autocomplete="new-password" spellcheck="false" required>
+    </label>
+
+    <label class="field" for="confirm">
+      <span>Confirm password</span>
+      <input type="password" id="confirm" autocomplete="new-password" spellcheck="false" required>
+    </label>
+
+    <p class="hint">Minimum 12 characters. The password protects the key file; neither is ever stored on the server.</p>
+
+    <button type="submit" id="submit" class="primary">Encrypt and download</button>
+  </form>
+
+  <div id="progress-wrap" class="progress-wrap" hidden>
+    <div class="progress"><div id="progress-bar" class="progress-bar"></div></div>
+    <p id="progress-label" class="progress-label">Uploading…</p>
+  </div>
+
+  <p id="status" class="status" hidden role="status"></p>
+
+  <section id="result" class="result" hidden>
+    <h2>Encrypted</h2>
+    <p class="warn">Keep both files. Without the <code>.key</code> file <strong>and</strong> the password, the data cannot be recovered.</p>
+    <div class="downloads">
+      <a id="download-enc" class="secondary" download>Download ciphertext</a>
+      <a id="download-key" class="secondary" download>Download key file</a>
+    </div>
+    <p class="hint">Decrypt from a shell with: <code>encrypt decrypt &lt;file&gt;.enc &lt;file&gt;.key</code></p>
+  </section>
+
+  <footer>
+    <p class="hint">This page only encrypts. Decryption, directory support and secure deletion of originals live in the CLI, which is deliberately not reachable from here.</p>
+  </footer>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

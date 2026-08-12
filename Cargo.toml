@@ -12,10 +12,17 @@ name = "encrypt"
 path = "src/main.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "encrypt-web"
+path = "src/bin/web.rs"
+required-features = ["web"]
+
 [features]
 default = ["cli"]
-# Filesystem operations and the interactive CLI
+# Filesystem operations and the interactive CLI; never enabled for the web image
 cli = ["dep:indicatif", "dep:walkdir", "dep:rpassword"]
+# HTTP service; never enabled for the CLI image
+web = ["dep:axum", "dep:tokio", "dep:base64", "dep:libc"]
 
 [dependencies]
 chacha20poly1305 = "0.10"
@@ -27,6 +34,19 @@ zeroize = { version = "1.7", features = ["derive"] }
 indicatif = { version = "0.17", optional = true }
 walkdir = { version = "2", optional = true }
 rpassword = { version = "7", optional = true }
+
+axum = { version = "0.8", features = ["multipart"], optional = true }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+], optional = true }
+base64 = { version = "0.22", optional = true }
+libc = { version = "0.2", optional = true }
 
 [profile.release]
 strip = true
