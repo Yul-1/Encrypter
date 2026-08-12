@@ -1,14 +1,32 @@
 [package]
 name = "encrypt"
-version = "0.5.6"
+version = "0.6.0"
 edition = "2021"
+
+[lib]
+name = "encrypt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "encrypt"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# Filesystem operations and the interactive CLI
+cli = ["dep:indicatif", "dep:walkdir", "dep:rpassword"]
 
 [dependencies]
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
 rand = "0.8"
-indicatif = "0.17"
-walkdir = "2"
-rpassword = "7"
 sha2 = "0.10"
 zeroize = { version = "1.7", features = ["derive"] }
+
+indicatif = { version = "0.17", optional = true }
+walkdir = { version = "2", optional = true }
+rpassword = { version = "7", optional = true }
+
+[profile.release]
+strip = true
