@@ -3,6 +3,7 @@
 ## [2026-08-12]
 
 ### Added
+- `COMMANDS.md`: command reference covering build, encrypt, decrypt, scripted prompts, service management, the HTTP endpoint and the test suites. Every command in it was run verbatim before being written down.
 - `scripts/build-cli.sh`: produces `dist/encrypt`, a standalone statically linked musl binary. It uses a throwaway `rust` container as a compiler when no local toolchain is present, but the resulting binary has no runtime dependency on Docker.
 - Per-request logging on the web service (method, path, status, request size, duration); filenames and passwords are never logged.
 - `GET /api/config`, exposing `max_upload_bytes` and `min_password_length`, so the page rejects an oversized file before starting an upload the server would abort mid-stream (browsers surface that abort as a bare network error instead of the 413).
@@ -13,6 +14,7 @@
 - `MANUAL-TESTS.md` with the browser and interactive checks the automated suites cannot cover, including full decryption of browser-produced artifacts.
 
 ### Changed
+- The web service no longer restarts on its own: the compose restart policy is `no`, so it comes up only when started deliberately with `docker compose up -d`.
 - Only the web encrypter is containerized. The `cli` image target was removed: the CLI is the privileged, filesystem-facing tool and ships as a plain binary, without volume mounts, uid mapping or TTY friction. Both test suites now drive that binary directly.
 - The web page shows the file size against the server limit as soon as a file is dropped, and reports dropped connections, aborts and timeouts distinctly.
 - Split the single-file CLI into `src/lib.rs`, `src/crypto.rs` (stream-based core, no filesystem access) and `src/fsops.rs` (filesystem operations). `src/main.rs` now only handles arguments and prompts.

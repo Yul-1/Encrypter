@@ -43,6 +43,8 @@ docker build --target web -t encrypt-web:0.6.0 .
 cargo build --release --no-default-features --features web
 ```
 
+`COMMANDS.md` is the short reference for everything you type: build, encrypt, decrypt, service management and the HTTP endpoint.
+
 ## Usage (CLI)
 Generate a password-protected key and encrypt:
 ```bash

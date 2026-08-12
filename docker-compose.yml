@@ -22,7 +22,9 @@ services:
     # Argon2id costs 64 MiB per worker; the limit keeps the ceiling predictable
     mem_limit: 512m
     pids_limit: 128
-    restart: unless-stopped
+    # Manual start only: the service is brought up deliberately with
+    # `docker compose up -d`, never on its own after a reboot
+    restart: "no"
     healthcheck:
       test: ["CMD", "/usr/local/bin/encrypt-web", "--healthcheck"]
       interval: 30s

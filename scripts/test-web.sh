@@ -260,6 +260,13 @@ else
     fail "no-new-privileges is set"
 fi
 
+restart_policy="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER")"
+if [ "$restart_policy" = "no" ] || [ -z "$restart_policy" ]; then
+    pass "service is started manually, never automatically"
+else
+    fail "service is started manually, never automatically (policy: $restart_policy)"
+fi
+
 if [ -z "$(docker diff "$CONTAINER")" ]; then
     pass "no filesystem writes after serving traffic"
 else
