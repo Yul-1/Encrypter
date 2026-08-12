@@ -1,0 +1,17 @@
+target/
+.git/
+.gitignore
+Test/
+scripts/
+*.key
+*.enc
+*.log
+*.old
+*.7z
+*.zip
+*.txt
+*.md
+*.MD
+Dockerfile
+docker-compose.yml
+dist/

@@ -1,0 +1,31 @@
+services:
+  encrypt-web:
+    build:
+      context: .
+      target: web
+    image: encrypt-web:0.6.0
+    container_name: encrypt-web
+    # Loopback only: the service has no authentication by default
+    ports:
+      - "127.0.0.1:8085:8080"
+    environment:
+      ENCRYPT_WEB_BIND: "0.0.0.0:8080"
+      ENCRYPT_WEB_MAX_UPLOAD_MB: "64"
+      ENCRYPT_WEB_CONCURRENCY: "2"
+      # ENCRYPT_WEB_TOKEN: "set-me-if-this-leaves-loopback"
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Argon2id costs 64 MiB per worker; the limit keeps the ceiling predictable
+    mem_limit: 512m
+    pids_limit: 128
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/encrypt-web", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
