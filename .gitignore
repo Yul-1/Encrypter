@@ -7,3 +7,4 @@ Test/
 *.7z
 *.zip
 dist/
+CHANGELOG.md
