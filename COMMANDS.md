@@ -1,43 +1,101 @@
 # Command reference
 
-Everything you actually type, in one place. `$ENC` is the CLI binary: after
-`./scripts/build-cli.sh` it lives at `./dist/encrypt`.
+Everything you actually type, in one place.
 
-```bash
-export ENC="$PWD/dist/encrypt"
-```
+The project ships two separate things. The **CLI** is a plain binary you run
+from a shell; it never runs in a container. The **web encrypter** is the only
+containerized component, and it only ever starts because you started it.
 
 ---
 
-## Build
+## Get the CLI
+
+### 1. Build the binary
+
+Run one of these by hand; nothing builds automatically.
+
+| Situation | Command | Result |
+| --- | --- | --- |
+| Rust installed | `cargo build --release` | `target/release/encrypt` |
+| No Rust, Docker available | `./scripts/build-cli.sh` | `dist/encrypt` |
+
+`scripts/build-cli.sh` picks the same two paths on its own: with a local
+`cargo` it builds natively, without one it starts a throwaway `rust` container
+purely as a compiler (`docker run --rm`, gone the moment the build ends) and
+emits a statically linked musl binary. Either way it copies the result to
+`dist/encrypt`, so that path is always the freshest build.
+
+A cache volume named `encrypt-cargo-cache` survives between runs to keep later
+builds fast; it is the only thing the script leaves behind.
+
+The binary that comes out is self-contained. It does not need Docker, Rust, or
+any shared library at runtime — and it is a Linux binary, so it runs under WSL
+but not in PowerShell or CMD.
+
+### 2. Put it on your PATH
+
+Until you do this, `encrypt` is not a command: you have to spell out the full
+path to the binary every time.
+
+```bash
+cp dist/encrypt ~/.local/bin/encrypt      # any directory on your PATH works
+```
+
+Check it took:
+
+```bash
+command -v encrypt      # -> /home/<you>/.local/bin/encrypt
+encrypt                 # prints the usage lines
+```
+
+Every CLI example below assumes this step. If you would rather not install it,
+the commands are identical with `./dist/encrypt` in place of `encrypt`.
+
+Re-run the copy after every rebuild — `cp` takes a snapshot, so a fresh
+`dist/encrypt` does not update the copy on your PATH by itself.
+
+---
+
+## Build the web service
 
 | Goal | Command |
 | --- | --- |
-| CLI, with a local Rust toolchain | `cargo build --release` (binary at `target/release/encrypt`) |
-| CLI, without a toolchain | `./scripts/build-cli.sh` (static binary at `dist/encrypt`) |
-| Web service image | `docker compose build` |
-| Web service, natively | `cargo build --release --no-default-features --features web` |
-
-The CLI needs nothing at runtime: `scripts/build-cli.sh` only borrows a `rust`
-container as a compiler, and the binary it produces is statically linked.
+| Service image | `docker compose build` |
+| Service, natively | `cargo build --release --no-default-features --features web` |
 
 ---
 
 ## CLI
 
+### Where the files land
+
+Both commands work from any directory, and the directory you happen to be in
+never affects the outcome. Everything is written **next to the file you named**:
+the `.enc` and the `.key` appear beside the original, and a decrypted file is
+restored beside its `.enc`.
+
+```bash
+cd ~
+encrypt encrypt /srv/data/report.pdf     # .enc and .key appear in /srv/data
+```
+
+The two arguments of `decrypt` are independent paths, so the `.enc` and the
+`.key` do not have to sit in the same directory — keeping them apart is the
+point.
+
 ### Encrypt
 
 ```bash
-"$ENC" encrypt <path>
+encrypt encrypt <path>
 ```
 
 `<path>` is a file or a directory. You are prompted twice for the password that
 protects the key file.
 
 ```bash
-"$ENC" encrypt ./report.pdf          # -> <random>.enc + report.key
-"$ENC" encrypt ./documents           # whole tree -> renamed dir + documents.key
-sudo "$ENC" encrypt /srv/archive     # privileged targets
+encrypt encrypt ./report.pdf          # -> <random>.enc + report.key
+encrypt encrypt ./documents           # whole tree -> renamed dir + documents.key
+sudo encrypt encrypt /srv/archive     # privileged targets
 ```
 
 What happens: the file is replaced by `<random>.enc`, its real name is stored
@@ -48,12 +106,13 @@ random identifier. Symlinks are skipped, never followed.
 ### Decrypt
 
 ```bash
-"$ENC" decrypt <path> <keyfile>
+encrypt decrypt <path> <keyfile>
 ```
 
 ```bash
-"$ENC" decrypt ./AbCd1234EfGh5678.enc ./report.key
-"$ENC" decrypt ./Xy9Zq2Lm4Np7Rs1T ./documents.key      # a directory
+encrypt decrypt ./AbCd1234EfGh5678.enc ./report.key
+encrypt decrypt ./Xy9Zq2Lm4Np7Rs1T ./documents.key      # a directory
+encrypt decrypt /srv/data/x.enc ~/keys/x.key          # the two can live apart
 ```
 
 Original names are restored from the encrypted metadata. On complete success
@@ -67,7 +126,7 @@ with the CLI, same command:
 
 ```bash
 cd ~/Downloads
-"$ENC" decrypt ./<random>.enc ./<random>.key
+encrypt decrypt ./<random>.enc ./<random>.key
 ```
 
 ### Scripting the prompts
@@ -76,8 +135,8 @@ The password prompt reads from `/dev/tty`, so a terminal is required. To drive
 it from a script, allocate a pty:
 
 ```bash
-printf 'my long password\nmy long password\n' | script -qec "'$ENC' encrypt ./file" /dev/null
-printf 'my long password\n'                   | script -qec "'$ENC' decrypt ./x.enc ./x.key" /dev/null
+printf 'my long password\nmy long password\n' | script -qec "encrypt encrypt ./file" /dev/null
+printf 'my long password\n'                   | script -qec "encrypt decrypt ./x.enc ./x.key" /dev/null
 ```
 
 ---
@@ -128,7 +187,7 @@ curl -sS -D headers.txt -o out.enc \
 
 # tr strips the CR of the HTTP line terminator, which base64 would reject
 grep -i '^x-encrypt-key:' headers.txt | tr -d '\r' | cut -d' ' -f2 | base64 -d > out.key
-"$ENC" decrypt ./out.enc ./out.key
+encrypt decrypt ./out.enc ./out.key
 ```
 
 The restored file takes back its original name. If that name is already taken —

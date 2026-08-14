@@ -35,6 +35,7 @@ Without a local Rust toolchain, `./scripts/build-cli.sh` borrows a throwaway `ru
 ./scripts/build-cli.sh
 ./dist/encrypt encrypt ./secret.pdf
 ```
+Copy it onto your `PATH` to call it as `encrypt` from anywhere — `cp dist/encrypt ~/.local/bin/encrypt`. See `COMMANDS.md` for the full command reference.
 
 ### Web service
 ```bash
